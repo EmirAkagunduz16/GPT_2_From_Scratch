@@ -244,25 +244,48 @@ model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 # model = torch.compile(model)
 
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(it):
+  # 1) linear warmup for warmup_iters steps
+  if it < warmup_steps:
+    return max_lr * (t+1) / warmup_steps
+  # 2) if it > lr_decay_iters, return min lr_rate
+  if it > max_steps:
+    return min_lr
+  # 3) in between, use cosine decay down to min learning rate
+  decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+  assert 0 <= decay_ratio <= 1
+  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+  return min_lr + coeff * (max_lr - min_lr)
+
+
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-for i in range(50):
+for step in range(max_steps):
   t0 = time.time()
   x, y = train_loader.next_batch()
-  assert x.size(0) == y.size(0), 'Input ve output boyutlari uyumusz'
   x, y = x.to(device), y.to(device)
   optimizer.zero_grad()
   with torch.autocast(device_type=device, dtype=torch.bfloat16):
     logits, loss = model(x, y)
-    # import code; code.interact(local=locals())  
+  # assert x.size(0) == y.size(0), 'Input ve output boyutlari uyumusz'
+  # # import code; code.interact(local=locals())  
   loss.backward()
   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # if i get unlucky sometimes, this occured high loss with high gradients so that model might be shocked. So I prevent that with this. 
+  # determine and set the learning rate for this iteration
+  lr = get_lr(step)
+  for param_group in optimizer.param_groups:
+    param_group['lr'] = lr
   optimizer.step()
-  torch.cuda.synchronize()
+  torch.cuda.synchronize() # wait for the GPU to finish work
   t1 = time.time()
   dt = (t1 - t0)*1000 # time difference in miliseconds 
-  tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-  print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+  tokens_per_sec = (train_loader.B * train_loader.T) / dt
+  print(f"step {step}, loss: {loss.item()}, | norm: {norm:.4f} | dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
   
   assert loss.item() >= 0, f"Negatif loss değeri: {loss.item()}"
 
